@@ -1,0 +1,7 @@
+build/
+output/
+.omx/
+.agents/
+.codex/
+*.log
+.DS_Store
