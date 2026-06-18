@@ -15,13 +15,22 @@
 #include <omp.h>
 #endif
 
-// 이 파일은 LBM과 별도로 둔 finite-volume/projection LES solver이다.
-// 최종 output은 LBM으로 만들었지만, FVM/FDM/FEM 계열 확장을 고려해
-// cell-centered FVM 구조, pressure projection, Smagorinsky LES를 구현해 두었다.
+// Optional finite-volume solver implementation kept for comparison and extensibility.
+
+// It uses a cell-centered projection method:
+
+// 1) explicit predictor (RK2) for momentum,
+
+// 2) solve pressure Poisson for divergence-free correction,
+
+// 3) correct u/v fields with pressure gradient.
+
+// Geometry and output interface are kept intentionally similar to LBMSolver.
+
 
 namespace {
 
-// MPI_Gatherv 출력 gather용 count 계산.
+// Compute MPI_Gatherv counts for output gathering.
 std::vector<int> counts_for_y(int ny, int nx, int size) {
     std::vector<int> counts(size, 0);
     const int base = ny / size;
@@ -30,23 +39,26 @@ std::vector<int> counts_for_y(int ny, int nx, int size) {
     return counts;
 }
 
-// gather displacement 계산.
+// Compute gather displacements.
 std::vector<int> displs_from_counts(const std::vector<int>& counts) {
     std::vector<int> displs(counts.size(), 0);
     for (std::size_t i = 1; i < counts.size(); ++i) displs[i] = displs[i - 1] + counts[i - 1];
     return displs;
 }
 
-// VTK step 파일명 생성 helper.
+// Helper for VTK filename generation.
 std::string step_name(const std::string& dir, const std::string& prefix, int step) {
     std::ostringstream path;
     path << dir << '/' << prefix << '_' << std::setw(7) << std::setfill('0') << step << ".vtk";
     return path.str();
 }
 
-} // 익명 namespace
+} // anonymous namespace
 
-// constructor에서 mesh 분해, 물리 파라미터, 배열 할당, 초기 조건을 모두 준비한다.
+// Constructor builds decomposition and all state arrays once, then applies initial conditions.
+
+// The timestep is fixed from CFL and never changed later in the run.
+
 FVMSolver::FVMSolver(const Options& opt, const Geometry2D& geom, MPI_Comm comm)
     : opt_(opt), geom_(geom), comm_(comm) {
     MPI_Comm_rank(comm_, &rank_);
@@ -56,11 +68,11 @@ FVMSolver::FVMSolver(const Options& opt, const Geometry2D& geom, MPI_Comm comm)
     if (ny_ < size_) throw std::runtime_error("Number of MPI ranks must not exceed mesh.ny");
     decompose();
 
-    // FVM도 timestep은 CFL 기반으로 시작 시 한 번만 계산하고 run 중 고정한다.
+    // FVM timestep is calculated once from CFL at startup and kept fixed.
     dx_ = opt_.domain_length / static_cast<double>(nx_ - 1);
     dy_ = opt_.domain_height / static_cast<double>(ny_ - 1);
-    dt_ = opt_.cfl * std::min(dx_, dy_) / opt_.inlet_velocity; // 전체 run 동안 고정
-    // mu가 있으면 nu=mu/rho, 없으면 Re로부터 nu=U*L/Re 계산.
+    dt_ = opt_.cfl * std::min(dx_, dy_) / opt_.inlet_velocity; // fixed for the full run
+    // Compute nu=mu/rho if mu is provided; otherwise nu=U*L/Re.
     if (opt_.dynamic_viscosity > 0.0) {
         nu_ = opt_.dynamic_viscosity / opt_.density;
         re_ = opt_.inlet_velocity * opt_.car_length / nu_;
@@ -71,7 +83,7 @@ FVMSolver::FVMSolver(const Options& opt, const Geometry2D& geom, MPI_Comm comm)
     eta_ = opt_.car_length * std::pow(std::max(re_, 1.0), -0.75);
     ref_height_ = geom_.height() > 0.0 ? geom_.height() : opt_.car_height;
 
-    // halo 2줄을 포함한 cell-centered 배열 할당.
+    // Allocate cell-centered arrays including two halo rows.
     const std::size_t n = static_cast<std::size_t>(local_ny_ + 2) * static_cast<std::size_t>(nx_);
     u_.assign(n, opt_.inlet_velocity);
     v_.assign(n, 0.0);
@@ -94,40 +106,51 @@ FVMSolver::FVMSolver(const Options& opt, const Geometry2D& geom, MPI_Comm comm)
     initialize_outputs();
 }
 
-// y 방향 1차원 MPI domain decomposition.
+// 1D MPI strip decomposition along y:
+// - each rank gets local_ny_ rows,
+// - distribution of remainder rows follows first ranks first.
 void FVMSolver::decompose() {
+    // Base chunk size from equal split; remainder rows are handed out to the lowest ranks first.
     const int base = ny_ / size_;
     const int rem = ny_ % size_;
     local_ny_ = base + (rank_ < rem ? 1 : 0);
+    // y_start converts local row index to global coordinates for geometry lookup and BC checks.
     y_start_ = rank_ * base + std::min(rank_, rem);
+    // Neighbor ranks used by MPI_Sendrecv halo exchanges.
     lower_rank_ = (y_start_ > 0) ? rank_ - 1 : MPI_PROC_NULL;
     upper_rank_ = (y_start_ + local_ny_ < ny_) ? rank_ + 1 : MPI_PROC_NULL;
 }
 
-// 초기 속도장과 solid mask 생성. perturbation은 wake 발달을 돕기 위한 작은 교란이다.
+// Build fluid/solid masks and initialize velocity field.
+// Nonzero perturbation seeds wake structures while preserving inlet speed amplitude.
 void FVMSolver::initialize_fields() {
+    // Build one consistent initial flow field for both interior and halo rows.
     for (int ly = 0; ly < local_ny_ + 2; ++ly) {
         const int gy = global_y(ly);
         const bool valid_y = valid_global_y(gy);
         const double y = valid_y ? phys_y_from_global(gy) : -1.0;
         for (int x = 0; x < nx_; ++x) {
             const double px = phys_x(x);
+            // Cell is inside geometry if local point is inside any registered primitive.
             const bool solid = valid_y && geom_.contains(px, y);
             const int c = cell(ly, x);
             solid_[c] = solid ? 1 : 0;
             const double phase = 2.0 * 3.14159265358979323846 *
                 (static_cast<double>(x) / std::max(1, nx_ - 1) +
                  static_cast<double>(std::max(gy, 0)) / std::max(1, ny_ - 1));
+            // Small sine/cosine perturbation seeds wake asymmetry while preserving mean inflow speed.
             u_[c] = solid ? 0.0 : opt_.inlet_velocity * (1.0 + opt_.perturbation * std::sin(phase));
             v_[c] = solid ? 0.0 : opt_.inlet_velocity * opt_.perturbation * 0.1 * std::cos(phase);
         }
     }
+    // Apply BC once and synchronize halos before the first time step.
     apply_velocity_bc(u_, v_);
     exchange_scalar_rows(u_, 1000);
     exchange_scalar_rows(v_, 1020);
 }
 
-// rank 0에서 출력 디렉터리와 CSV/geometry VTK를 준비한다.
+// Rank 0 prepares output path and drag history CSV.
+// Geometry VTK is written once and reused for debugging in ParaView.
 void FVMSolver::initialize_outputs() {
     if (rank_ == 0) {
         std::filesystem::create_directories(opt_.output_dir);
@@ -138,7 +161,8 @@ void FVMSolver::initialize_outputs() {
     }
 }
 
-// FVM solver의 실행 설정 요약 출력.
+// Print solver parameter summary only on rank 0.
+// Includes pressure solver settings that strongly influence stability/accuracy.
 void FVMSolver::print_summary() const {
     if (rank_ != 0) return;
     std::cout << "Case: " << opt_.case_name << "\n"
@@ -160,7 +184,8 @@ void FVMSolver::print_summary() const {
               << "]..[" << geom_.max_x() << ',' << geom_.max_y() << "]\n" << std::flush;
 }
 
-// scalar field halo row 교환.
+// Exchange scalar halo rows used for gradients/stencils and velocity corrections.
+// One-direction Sendrecv form avoids extra temporary storage.
 void FVMSolver::exchange_scalar_rows(std::vector<double>& a, int tag_base) const {
     MPI_Sendrecv(a.data() + cell(local_ny_, 0), nx_, MPI_DOUBLE, upper_rank_, tag_base,
                  a.data() + cell(0, 0), nx_, MPI_DOUBLE, lower_rank_, tag_base,
@@ -170,15 +195,18 @@ void FVMSolver::exchange_scalar_rows(std::vector<double>& a, int tag_base) const
                  comm_, MPI_STATUS_IGNORE);
 }
 
-// 속도 경계조건: inlet Dirichlet, outlet zero-gradient, solid no-slip,
-// bottom moving-ground, top freestream을 적용한다.
+// Velocity boundary conditions:
+// - x=0: inflow Dirichlet (Ux=Uin, Uy=0)
+// - x=end: zero-gradient outflow
+// - solid cells: no-slip enforced each iteration
+// - bottom/top physical boundaries: moving floor-like / freestream conditions.
 void FVMSolver::apply_velocity_bc(std::vector<double>& u, std::vector<double>& v) {
 #pragma omp parallel for schedule(static)
     for (int ly = 1; ly <= local_ny_; ++ly) {
-        // inlet 지정 속도 Dirichlet 조건.
+        // Inlet: prescribed-velocity Dirichlet condition.
         u[cell(ly, 0)] = opt_.inlet_velocity;
         v[cell(ly, 0)] = 0.0;
-        // outlet zero-gradient 조건.
+        // Outlet: zero-gradient condition.
         u[cell(ly, nx_ - 1)] = u[cell(ly, nx_ - 2)];
         v[cell(ly, nx_ - 1)] = v[cell(ly, nx_ - 2)];
         for (int x = 0; x < nx_; ++x) {
@@ -193,7 +221,7 @@ void FVMSolver::apply_velocity_bc(std::vector<double>& u, std::vector<double>& v
 #pragma omp parallel for schedule(static)
         for (int x = 0; x < nx_; ++x) {
             if (!is_solid(ly, x)) {
-                u[cell(ly, x)] = opt_.inlet_velocity; // 움직이는 지면 조건
+                u[cell(ly, x)] = opt_.inlet_velocity; // moving-ground boundary
                 v[cell(ly, x)] = 0.0;
             }
         }
@@ -203,19 +231,20 @@ void FVMSolver::apply_velocity_bc(std::vector<double>& u, std::vector<double>& v
 #pragma omp parallel for schedule(static)
         for (int x = 0; x < nx_; ++x) {
             if (!is_solid(ly, x)) {
-                u[cell(ly, x)] = opt_.inlet_velocity; // 상단 자유류 조건
+                u[cell(ly, x)] = opt_.inlet_velocity; // top freestream boundary
                 v[cell(ly, x)] = 0.0;
             }
         }
     }
 }
 
-// 압력 보정 phi의 경계조건. outlet은 reference pressure로 0을 둔다.
+// Pressure correction BCs.
+// Outlet reference pressure is pinned to zero to remove null-space, inlet uses Neumann.
 void FVMSolver::apply_pressure_bc(std::vector<double>& phi) {
 #pragma omp parallel for schedule(static)
     for (int ly = 1; ly <= local_ny_; ++ly) {
-        phi[cell(ly, 0)] = phi[cell(ly, 1)];       // inlet Neumann 조건
-        phi[cell(ly, nx_ - 1)] = 0.0;              // outlet 기준 압력
+        phi[cell(ly, 0)] = phi[cell(ly, 1)];       // inlet Neumann condition
+        phi[cell(ly, nx_ - 1)] = 0.0;              // outlet reference pressure
         for (int x = 0; x < nx_; ++x) {
             if (is_solid(ly, x)) phi[cell(ly, x)] = 0.0;
         }
@@ -232,10 +261,13 @@ void FVMSolver::apply_pressure_bc(std::vector<double>& phi) {
     }
 }
 
-// Smagorinsky LES 점성 계산. molecular nu에 eddy viscosity를 더하되
-// 너무 커지는 것을 fvm_nu_eff_max_factor로 제한한다.
+// Smagorinsky LES viscosity update.
+// Each cell:
+// nu_eff = nu_mol + (C_s * Delta)^2 * |S|,
+// then clipped by fvm_nu_eff_max_factor to avoid over-diffusion.
 void FVMSolver::compute_les_viscosity(const std::vector<double>& u, const std::vector<double>& v) {
     const double delta = opt_.les_filter_width_cells * std::sqrt(dx_ * dy_);
+    // csd2 is the common factor multiplying |S| for Smagorinsky ν_t.
     const double csd2 = opt_.smagorinsky_cs * opt_.smagorinsky_cs * delta * delta;
 #pragma omp parallel for schedule(static)
     for (int ly = 1; ly <= local_ny_; ++ly) {
@@ -265,8 +297,9 @@ void FVMSolver::compute_les_viscosity(const std::vector<double>& u, const std::v
     exchange_scalar_rows(nu_eff_, 1040);
 }
 
-// explicit predictor에 사용할 RHS 계산.
-// 대류항은 face 평균 기반 2차 중심형 flux, 확산항은 variable viscosity 중심차분 형태이다.
+// Compute momentum RHS for explicit stage.
+// Convection uses face-centered 2nd-order averaging;
+// diffusion uses viscosity-averaged central second differences.
 void FVMSolver::compute_rhs(const std::vector<double>& u, const std::vector<double>& v,
                             std::vector<double>& ru, std::vector<double>& rv) const {
     const double inv_dx = 1.0 / dx_;
@@ -312,14 +345,15 @@ void FVMSolver::compute_rhs(const std::vector<double>& u, const std::vector<doub
     }
 }
 
-// projection method의 pressure Poisson equation을 Jacobi/SOR-like relaxation으로 푼다.
-// MPI rank 간 phi halo를 매 반복마다 교환하고 global residual로 조기 종료한다.
+// Pressure Poisson solve via iterative Jacobi/SOR-style update.
+// Residual is checked every 10 iterations via global max norm and stopped early if converged.
 double FVMSolver::pressure_poisson() {
     std::fill(phi_.begin(), phi_.end(), 0.0);
     std::fill(phi_new_.begin(), phi_new_.end(), 0.0);
     const double dx2 = dx_ * dx_;
     const double dy2 = dy_ * dy_;
     const double denom = 2.0 * (dx2 + dy2);
+    // Return the final global residual as a convergence quality indicator.
     double global_res = 0.0;
     for (int iter = 0; iter < opt_.fvm_pressure_iterations; ++iter) {
         exchange_scalar_rows(phi_, 1060);
@@ -358,8 +392,10 @@ double FVMSolver::pressure_poisson() {
     return global_res;
 }
 
-// tentative velocity u_star/v_star를 divergence-free에 가깝게 보정한다.
-// 보정 pressure phi를 누적해 p_ field도 업데이트한다.
+// Velocity projection step:
+// 1) compute divergence of tentative field (rhs),
+// 2) solve pressure correction,
+// 3) subtract gradient(phi) to enforce incompressibility.
 void FVMSolver::project_velocity() {
 #pragma omp parallel for schedule(static)
     for (int ly = 1; ly <= local_ny_; ++ly) {
@@ -405,7 +441,7 @@ std::vector<double> FVMSolver::local_scalar(const std::vector<double>& a) const 
     return out;
 }
 
-// solid mask를 0/1 scalar로 변환해 VTK에 함께 출력한다.
+// Convert solid mask to 0/1 scalar and output it in VTK.
 std::vector<double> FVMSolver::local_solid() const {
     std::vector<double> out(static_cast<std::size_t>(local_ny_) * nx_);
     for (int ly = 1; ly <= local_ny_; ++ly)
@@ -413,7 +449,7 @@ std::vector<double> FVMSolver::local_solid() const {
     return out;
 }
 
-// wake 구조 확인용 vorticity field. 중앙차분으로 계산한다.
+// Vorticity field for wake inspection, computed by central differencing.
 std::vector<double> FVMSolver::local_vorticity() const {
     std::vector<double> out(static_cast<std::size_t>(local_ny_) * nx_);
     for (int ly = 1; ly <= local_ny_; ++ly) {
@@ -431,10 +467,10 @@ std::vector<double> FVMSolver::local_vorticity() const {
     return out;
 }
 
-// LES 포함 유효 점성계수를 출력 field로 사용한다.
+// Output LES-effective viscosity field.
 std::vector<double> FVMSolver::local_nu_eff() const { return local_scalar(nu_eff_); }
 
-// rank별 local field를 rank 0 전역 field로 gather한다.
+// Gather each rank's local field to a global field on rank 0.
 std::vector<double> FVMSolver::gather_scalar(const std::vector<double>& local) const {
     const auto counts = counts_for_y(ny_, nx_, size_);
     const auto displs = displs_from_counts(counts);
@@ -446,7 +482,7 @@ std::vector<double> FVMSolver::gather_scalar(const std::vector<double>& local) c
     return global;
 }
 
-// ParaView용 VTK 출력.
+// Output VTK files for ParaView.
 void FVMSolver::write_vtk(int step) {
     const auto gu = gather_scalar(local_scalar(u_));
     const auto gv = gather_scalar(local_scalar(v_));
@@ -461,7 +497,8 @@ void FVMSolver::write_vtk(int step) {
     }
 }
 
-// solid-fluid 인접 face에서 압력력과 점성력을 근사해 drag/lift를 적분한다.
+// Drag/lift estimation by scanning fluid-solid interfaces.
+// Pressure and viscous contributions are accumulated for each adjacent face pair and reduced to rank 0.
 void FVMSolver::write_drag(int step) {
     double local_fx = 0.0;
     double local_fy = 0.0;
@@ -471,7 +508,7 @@ void FVMSolver::write_drag(int step) {
             const int c = cell(ly, x);
             if (solid_[c]) continue;
             const int nbrs[4] = {cell(ly, x + 1), cell(ly, x - 1), cell(ly + 1, x), cell(ly - 1, x)};
-            const double nxn[4] = {-1.0, 1.0, 0.0, 0.0}; // 해당 solid 이웃 기준 solid->fluid 법선
+            const double nxn[4] = {-1.0, 1.0, 0.0, 0.0}; // interface normal from solid to fluid for each neighbor
             const double nyn[4] = {0.0, 0.0, -1.0, 1.0};
             const double area[4] = {dy_, dy_, dx_, dx_};
             for (int k = 0; k < 4; ++k) {
@@ -505,21 +542,26 @@ void FVMSolver::write_drag(int step) {
     }
 }
 
-// FVM time loop: RK2 predictor로 대류/확산을 적분한 뒤 pressure projection을 수행한다.
+// FVM time loop (fixed dt).
+// Stages: LES update -> RK2 predictor-corrector -> projection -> optional output.
 void FVMSolver::run() {
+    // Print setup summary and store an initial snapshot at t=0 for restart/debug parity.
     print_summary();
     compute_les_viscosity(u_, v_);
     write_vtk(0);
     write_drag(0);
     for (int step = 1; step <= opt_.steps; ++step) {
+        // Step 1: synchronize current field halos before derivative evaluations.
         exchange_scalar_rows(u_, 1160);
         exchange_scalar_rows(v_, 1180);
+        // Step 2: update eddy viscosity and momentum RHS on current fields.
         compute_les_viscosity(u_, v_);
         compute_rhs(u_, v_, rhs_u_, rhs_v_);
 #pragma omp parallel for schedule(static)
         for (int ly = 1; ly <= local_ny_; ++ly) {
             for (int x = 0; x < nx_; ++x) {
                 const int c = cell(ly, x);
+                // RK2 predictor from Euler step.
                 u_pred_[c] = u_[c] + dt_ * rhs_u_[c];
                 v_pred_[c] = v_[c] + dt_ * rhs_v_[c];
             }
@@ -527,12 +569,14 @@ void FVMSolver::run() {
         apply_velocity_bc(u_pred_, v_pred_);
         exchange_scalar_rows(u_pred_, 1200);
         exchange_scalar_rows(v_pred_, 1220);
+        // Step 3: second RHS from predicted fields then combine both stages.
         compute_les_viscosity(u_pred_, v_pred_);
         compute_rhs(u_pred_, v_pred_, rhs_u2_, rhs_v2_);
 #pragma omp parallel for schedule(static)
         for (int ly = 1; ly <= local_ny_; ++ly) {
             for (int x = 0; x < nx_; ++x) {
                 const int c = cell(ly, x);
+                // RK2 correction to improve time accuracy while keeping dt fixed.
                 u_star_[c] = u_[c] + 0.5 * dt_ * (rhs_u_[c] + rhs_u2_[c]);
                 v_star_[c] = v_[c] + 0.5 * dt_ * (rhs_v_[c] + rhs_v2_[c]);
             }
@@ -540,6 +584,7 @@ void FVMSolver::run() {
         apply_velocity_bc(u_star_, v_star_);
         exchange_scalar_rows(u_star_, 1240);
         exchange_scalar_rows(v_star_, 1260);
+        // Step 4: enforce divergence-free constraint and refresh eddy viscosity after projection.
         project_velocity();
         compute_les_viscosity(u_, v_);
         if (step % opt_.drag_interval == 0 || step == opt_.steps) write_drag(step);

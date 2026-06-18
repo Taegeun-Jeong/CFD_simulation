@@ -17,14 +17,19 @@
 #include <omp.h>
 #endif
 
-// 이 파일은 최종 결과 생성에 사용한 production solver이다.
-// 계산 순서는 macro field 계산 -> LES relaxation time 계산 -> collision ->
-// streaming/bounce-back -> boundary condition -> output/drag 기록으로 구성된다.
-// MPI 통신은 y 방향 halo row 교환에만 사용하고, 격자 내부 반복은 OpenMP로 병렬화한다.
+// Production solver used for final runs and publication-style output.
+// Internal step order is:
+// 1) compute_macros()       : derive rho/ux/uy from f.
+// 2) compute_les_tau()      : update eddy-viscosity-adjusted tau field.
+// 3) collide()              : BGK relaxation toward equilibrium.
+// 4) stream_and_bounce()    : transport along lattice + bounce-back at solid.
+// 5) apply_boundaries()     : enforce inlet/outlet/top/bottom constraints.
+// 6) output/drag/log checks : VTK/CSV interval tasks.
+// MPI exchanges are only halo rows in y, while x-range loops are OpenMP-parallel.
 
 namespace {
 
-// MPI_Gatherv로 rank별 local row를 모을 때 필요한 수신 count 계산.
+// Compute receive counts for MPI_Gatherv when gathering local rows.
 std::vector<int> counts_for_y(int ny, int nx, int size) {
     std::vector<int> counts(size, 0);
     const int base = ny / size;
@@ -33,24 +38,25 @@ std::vector<int> counts_for_y(int ny, int nx, int size) {
     return counts;
 }
 
-// counts 배열에서 displacement 배열을 만든다.
+// Build displacement array from counts.
 std::vector<int> displs_from_counts(const std::vector<int>& counts) {
     std::vector<int> displs(counts.size(), 0);
     for (std::size_t i = 1; i < counts.size(); ++i) displs[i] = displs[i - 1] + counts[i - 1];
     return displs;
 }
 
-// step 번호가 포함된 VTK 파일 이름을 일관되게 만든다.
+// Build consistent VTK filenames including step numbers.
 std::string step_name(const std::string& dir, const std::string& prefix, int step) {
     std::ostringstream path;
     path << dir << '/' << prefix << '_' << std::setw(7) << std::setfill('0') << step << ".vtk";
     return path.str();
 }
 
-} // 익명 namespace
+} // anonymous namespace
 
-// constructor에서 모든 물리/lattice 스케일을 계산하고 배열을 할당한다.
-// dt는 CFL로 여기서 한 번만 계산되며 run 중에는 절대 변경하지 않는다.
+// Constructor computes physical/lattice scaling and allocates all arrays.
+// Important: dt is evaluated once from CFL and held constant through the whole run,
+// matching the "fixed timestep, fixed mapping" requirement.
 LBMSolver::LBMSolver(const Options& opt, const Geometry2D& geom, MPI_Comm comm)
     : opt_(opt), geom_(geom), comm_(comm) {
     MPI_Comm_rank(comm_, &rank_);
@@ -62,13 +68,17 @@ LBMSolver::LBMSolver(const Options& opt, const Geometry2D& geom, MPI_Comm comm)
     }
     decompose();
 
-    // 물리 격자와 lattice 단위 변환.
+    // Convert problem dimensions and time step between physical space and lattice space.
+    // dx and dy are uniform; dt is chosen from CFL so that u_lu_* = U*dt/dx.
     dx_ = opt_.domain_length / static_cast<double>(nx_ - 1);
     dy_ = opt_.domain_height / static_cast<double>(ny_ - 1);
     dt_ = opt_.cfl * dx_ / opt_.inlet_velocity;
     u_lu_ = opt_.inlet_velocity * dt_ / dx_;
 
-    // mu가 주어지면 nu=mu/rho, 아니면 Reynolds 수로부터 nu=U*L/Re 계산.
+    // Viscosity path:
+    // - if dynamic_viscosity>0, use nu = mu/rho directly,
+    // - otherwise infer from Reynolds as nu = U*L/Re.
+    // This supports both dimensional and non-dimensional workflows.
     if (opt_.dynamic_viscosity > 0.0) {
         nu_phys_ = opt_.dynamic_viscosity / opt_.density;
         re_ = opt_.inlet_velocity * opt_.car_length / nu_phys_;
@@ -81,7 +91,8 @@ LBMSolver::LBMSolver(const Options& opt, const Geometry2D& geom, MPI_Comm comm)
     kolmogorov_eta_ = opt_.car_length * std::pow(std::max(re_, 1.0), -0.75);
     ref_height_ = geom_.height() > 0.0 ? geom_.height() : opt_.car_height;
 
-    // halo 2줄을 포함한 local 배열 할당.
+    // Allocate local 1D arrays with two halo rows to simplify halo exchange:
+    // valid interior cells are ly=1..local_ny_, halo is 0 and local_ny_+1.
     const std::size_t cells_with_halo = static_cast<std::size_t>(local_ny_ + 2) * static_cast<std::size_t>(nx_);
     f_.assign(cells_with_halo * Q, 0.0);
     post_.assign(cells_with_halo * Q, 0.0);
@@ -96,8 +107,8 @@ LBMSolver::LBMSolver(const Options& opt, const Geometry2D& geom, MPI_Comm comm)
     initialize_outputs();
 }
 
-// y 방향으로 행을 나누는 1D domain decomposition.
-// 나머지 row는 앞 rank부터 하나씩 더 받아 load balance를 맞춘다.
+// 1D domain decomposition by rows in y-direction.
+// Extra rows are distributed one by one from lower ranks for load balance.
 void LBMSolver::decompose() {
     const int base = ny_ / size_;
     const int rem = ny_ % size_;
@@ -107,15 +118,18 @@ void LBMSolver::decompose() {
     upper_rank_ = (y_start_ + local_ny_ < ny_) ? rank_ + 1 : MPI_PROC_NULL;
 }
 
-// D2Q9 equilibrium distribution. LBM collision 단계의 기준 분포이다.
+// D2Q9 equilibrium distribution, the target for LBM collision step.
 double LBMSolver::equilibrium(int q, double rho, double ux, double uy) const {
     const double cu = 3.0 * (static_cast<double>(cx[q]) * ux + static_cast<double>(cy[q]) * uy);
     const double uu = ux * ux + uy * uy;
     return wt[q] * rho * (1.0 + cu + 0.5 * cu * cu - 1.5 * uu);
 }
 
-// 초기 조건: 전체 유동을 inlet 속도 근처로 놓고 작은 perturbation을 더한다.
-// 차량 내부 solid cell은 속도 0, 분포함수는 정지 equilibrium으로 초기화한다.
+// Initialize conditions for both fluid and solid regions.
+// 1) Query geometry membership for each cell center.
+// 2) Build perturbation pattern based on cell index (x, y) to trigger early wake formation.
+// 3) Fill D2Q9 distributions with local equilibrium corresponding to rho=1 and ux/uy.
+// 4) Clamp all inlet/outlet strip cells to exactly specified inlet velocity.
 void LBMSolver::initialize_fields() {
     for (int ly = 0; ly < local_ny_ + 2; ++ly) {
         const int gy = global_y(ly);
@@ -145,20 +159,27 @@ void LBMSolver::initialize_fields() {
     }
 }
 
-// rank 0이 출력 디렉터리, geometry VTK, drag CSV를 준비한다.
+// Rank 0 prepares output directory, geometry VTK, and drag CSV.
+// Non-zero ranks do not open files; they only contribute reductions.
 void LBMSolver::initialize_outputs() {
     if (rank_ == 0) {
         std::filesystem::create_directories(opt_.output_dir);
         geom_.write_legacy_vtk(opt_.output_dir + "/" + opt_.output_prefix + "_geometry.vtk");
         drag_csv_.open(opt_.output_dir + "/" + opt_.output_prefix + "_drag.csv");
         if (!drag_csv_) throw std::runtime_error("Cannot open drag CSV in " + opt_.output_dir);
+        // Add a line-based header so downstream scripts know each CSV field order.
         drag_csv_ << "step,time_s,drag_lu,lift_lu,cd,cl,drag_N_per_m,lift_N_per_m\n";
     }
 }
 
-// 실행 시작 시 사용자가 확인해야 할 물리/수치 스케일을 rank 0에 출력한다.
+// Rank 0 prints a compact run summary:
+// - geometry name and bounds,
+// - mesh + CFL-derived scaling,
+// - Reynolds/Kolmogorov indicators,
+// - all accumulated runtime warnings.
 void LBMSolver::print_summary(const std::vector<std::string>& runtime_warnings) const {
     if (rank_ != 0) return;
+    // Provide one line summary of critical physical and numerical settings.
     std::cout << "Case: " << opt_.case_name << "\n"
               << "MPI ranks=" << size_ << ", OpenMP max threads=";
 #ifdef _OPENMP
@@ -166,23 +187,24 @@ void LBMSolver::print_summary(const std::vector<std::string>& runtime_warnings) 
 #else
     std::cout << 1;
 #endif
-    std::cout << "\nMesh=" << nx_ << "x" << ny_ << ", dx=" << dx_ << " m, dy=" << dy_ << " m\n"
-              << "Fixed dt=" << dt_ << " s, CFL/lattice U=" << u_lu_ << "\n"
+    std::cout << "\nMesh=" << nx_ << "x" << ny_ << ", dx=" << dx_ << " m, dy=" << dy_ << " m"
+              << "\nFixed dt=" << dt_ << " s, CFL/lattice U=" << u_lu_ << "\n"
               << "Re=" << re_ << ", nu_phys=" << nu_phys_ << " m^2/s, nu_lu=" << nu_lu_
               << ", tau0=" << tau0_ << "\n"
               << "Kolmogorov eta≈" << kolmogorov_eta_ << " m, dx/eta≈" << dx_ / kolmogorov_eta_
               << ", LES filter width≈" << opt_.les_filter_width_cells * dx_ << " m\n"
               << "Geometry=" << geom_.name() << ", bbox=[" << geom_.min_x() << ',' << geom_.min_y()
               << "]..[" << geom_.max_x() << ',' << geom_.max_y() << "]\n";
-    for (const auto& w : runtime_warnings) std::cout << "Warning: " << w << "\n";
+    for (const auto& w : runtime_warnings) std::cout << "Warning: " << w << "";
     if (tau0_ <= opt_.tau_min + 1.0e-12) {
         std::cout << "Warning: molecular tau is close to 0.5; high-Re LBM runs need finer meshes, lower CFL, "
-                     "or LES eddy viscosity to remain stable.\n";
+                     "or LES eddy viscosity to remain stable.";
     }
     std::cout << std::flush;
 }
 
-// scalar field halo row 교환. ux/uy 같은 cell field에 사용한다.
+// Exchange halo rows for scalar fields such as ux/uy.
+// Lowering communication overhead: one call per field per halo layer.
 void LBMSolver::exchange_scalar_rows(std::vector<double>& a, int tag_base) {
     const int row = nx_;
     MPI_Sendrecv(a.data() + cell(local_ny_, 0), row, MPI_DOUBLE, upper_rank_, tag_base,
@@ -193,7 +215,8 @@ void LBMSolver::exchange_scalar_rows(std::vector<double>& a, int tag_base) {
                  comm_, MPI_STATUS_IGNORE);
 }
 
-// 분포함수 f/post 배열은 방향 Q까지 포함하므로 row 크기가 nx*Q이다.
+// f_/post_ arrays include all Q directions, so one row is width nx*Q.
+// This routine mirrors exchange_scalar_rows but for the full direction set.
 void LBMSolver::exchange_dist_rows(std::vector<double>& a, int tag_base) {
     const int row = nx_ * Q;
     MPI_Sendrecv(a.data() + idx(local_ny_, 0, 0), row, MPI_DOUBLE, upper_rank_, tag_base,
@@ -204,8 +227,13 @@ void LBMSolver::exchange_dist_rows(std::vector<double>& a, int tag_base) {
                  comm_, MPI_STATUS_IGNORE);
 }
 
-// 분포함수 합으로 density와 velocity를 계산한다.
-// solid cell은 안정성을 위해 rho=1, velocity=0으로 고정한다.
+// Compute density and momentum from distribution sums.
+// For each cell:
+// rho = Σ f_i,
+// jx = Σ f_i * cx_i,
+// jy = Σ f_i * cy_i,
+// ux = jx/rho, uy = jy/rho.
+// Non-finite rho is clamped to 1.0 for resilience.
 void LBMSolver::compute_macros() {
 #pragma omp parallel for schedule(static)
     for (int ly = 1; ly <= local_ny_; ++ly) {
@@ -236,8 +264,10 @@ void LBMSolver::compute_macros() {
     exchange_scalar_rows(uy_, 320);
 }
 
-// Smagorinsky LES 모델: local strain-rate magnitude로 eddy viscosity를 더하고
-// relaxation time tau_eff를 tau_min/tau_max 범위 안으로 제한한다.
+// Smagorinsky LES model:
+// - estimate du/dx and dv/dy with 1-cell central/one-sided differencing,
+// - compute local strain invariant S,
+// - convert to subgrid viscosity, then tau_eff.
 void LBMSolver::compute_les_tau() {
     const double cs2 = opt_.smagorinsky_cs * opt_.smagorinsky_cs;
     const double delta2 = opt_.les_filter_width_cells * opt_.les_filter_width_cells;
@@ -280,7 +310,10 @@ void LBMSolver::compute_les_tau() {
     }
 }
 
-// BGK collision 단계. 각 방향 분포함수를 local equilibrium 쪽으로 relaxation한다.
+// BGK collision:
+// post = f - omega*(f-feq), where omega=1/tau_eff.
+// post_ is exchanged immediately after collision so neighbor ranks can stream
+// from already-relaxed populations.
 void LBMSolver::collide() {
 #pragma omp parallel for schedule(static)
     for (int ly = 1; ly <= local_ny_; ++ly) {
@@ -303,8 +336,11 @@ void LBMSolver::collide() {
     exchange_dist_rows(post_, 400);
 }
 
-// streaming과 immersed solid bounce-back을 동시에 수행한다.
-// solid 이웃에서 반사되는 분포의 운동량 변화량을 누적해 drag/lift 계산에 사용한다.
+// Streaming + bounce-back:
+// - For each interior cell and direction q, fetch population from opposite neighbor.
+// - If the source index is outside local array (domain boundary), keep old population.
+// - If source is solid, reverse direction with opposite population and accumulate force.
+// f_next_ is then swapped into f_ to begin next cycle.
 std::array<double, 2> LBMSolver::stream_and_bounce() {
     double fx = 0.0;
     double fy = 0.0;
@@ -339,15 +375,16 @@ std::array<double, 2> LBMSolver::stream_and_bounce() {
     return {fx, fy};
 }
 
-// 외부 경계조건 적용.
-// inlet/top/bottom은 prescribed velocity 계열, outlet은 긴 wake 안정성을 위해 zero-gradient이다.
+// Apply outer boundaries by rebuilding edge distributions.
+// This function is executed after streaming to satisfy boundary data for the next
+// macroscopic reconstruction call.
 void LBMSolver::apply_boundaries() {
     const double ux_bc = u_lu_;
     const double uy_bc = 0.0;
 
 #pragma omp parallel for schedule(static)
     for (int ly = 1; ly <= local_ny_; ++ly) {
-        // 서쪽 inlet: 지정 속도 Zou-He 조건.
+        // West inlet: prescribed-velocity Zou-He condition.
         int x = 0;
         if (!is_solid(ly, x)) {
             const double f0 = f_[idx(ly, x, 0)], f2 = f_[idx(ly, x, 2)], f4 = f_[idx(ly, x, 4)];
@@ -358,16 +395,16 @@ void LBMSolver::apply_boundaries() {
             f_[idx(ly, x, 8)] = f6 + (1.0 / 6.0) * rho * ux_bc - 0.5 * rho * uy_bc + 0.5 * (f2 - f4);
         }
 
-        // 동쪽 outlet: zero-gradient outflow.
-        // fixed-pressure Zou-He outlet은 짧은 run에서는 가능했지만 긴 wake를 반사해
-        // 장시간 적분에서 밀도 음수/불안정을 만들 수 있어 현재 조건으로 바꿨다.
+        // East outlet: zero-gradient outflow.
+        // Fixed-pressure Zou-He outlet worked in short runs but can reflect long wakes,
+        // and can cause negative density / instability in long runs; current condition is used instead.
         x = nx_ - 1;
         if (!is_solid(ly, x)) {
             for (int q = 0; q < Q; ++q) f_[idx(ly, x, q)] = f_[idx(ly, x - 1, q)];
         }
     }
 
-    // 아래쪽 ground/freestream 경계.
+    // Bottom ground/freestream boundary.
     if (y_start_ == 0) {
         const int ly = 1;
 #pragma omp parallel for schedule(static)
@@ -382,7 +419,7 @@ void LBMSolver::apply_boundaries() {
         }
     }
 
-    // 위쪽 freestream 경계.
+    // Top freestream boundary.
     if (y_start_ + local_ny_ == ny_) {
         const int ly = local_ny_;
 #pragma omp parallel for schedule(static)
@@ -397,7 +434,7 @@ void LBMSolver::apply_boundaries() {
         }
     }
 
-    // corner는 여러 Zou-He 조건이 겹쳐 over-constraint가 생길 수 있어 equilibrium으로 재설정한다.
+    // Corner may become over-constrained by mixed Zou-He BCs, so reset to equilibrium.
     if (y_start_ == 0) {
         const int ly = 1;
         for (int x : {0, nx_ - 1}) {
@@ -412,7 +449,7 @@ void LBMSolver::apply_boundaries() {
     }
 }
 
-// density field는 lattice 단위 그대로 출력한다.
+// Output density field in lattice units.
 std::vector<double> LBMSolver::make_local_scalar_rho() const {
     std::vector<double> out(static_cast<std::size_t>(local_ny_) * nx_);
     for (int ly = 1; ly <= local_ny_; ++ly)
@@ -420,7 +457,7 @@ std::vector<double> LBMSolver::make_local_scalar_rho() const {
     return out;
 }
 
-// 출력은 물리 단위가 이해하기 쉬우므로 ux lattice 값을 [m/s]로 변환한다.
+// Convert ux from lattice units to [m/s] for easier physical interpretation.
 std::vector<double> LBMSolver::make_local_scalar_ux_phys() const {
     std::vector<double> out(static_cast<std::size_t>(local_ny_) * nx_);
     const double scale = dx_ / dt_;
@@ -429,7 +466,7 @@ std::vector<double> LBMSolver::make_local_scalar_ux_phys() const {
     return out;
 }
 
-// uy도 ux와 같은 scale(dx/dt)로 물리 단위 변환한다.
+// Convert uy using the same dx/dt scaling as ux.
 std::vector<double> LBMSolver::make_local_scalar_uy_phys() const {
     std::vector<double> out(static_cast<std::size_t>(local_ny_) * nx_);
     const double scale = dx_ / dt_;
@@ -438,7 +475,7 @@ std::vector<double> LBMSolver::make_local_scalar_uy_phys() const {
     return out;
 }
 
-// solid mask를 0/1 scalar field로 출력해 ParaView에서 형상 위치를 확인한다.
+// Output solid mask as 0/1 scalar to locate geometry in ParaView.
 std::vector<double> LBMSolver::make_local_scalar_solid() const {
     std::vector<double> out(static_cast<std::size_t>(local_ny_) * nx_);
     for (int ly = 1; ly <= local_ny_; ++ly)
@@ -446,7 +483,7 @@ std::vector<double> LBMSolver::make_local_scalar_solid() const {
     return out;
 }
 
-// LES 포함 유효 점성계수를 lattice 단위로 출력한다.
+// Output LES effective viscosity in lattice units.
 std::vector<double> LBMSolver::make_local_scalar_nu_eff() const {
     std::vector<double> out(static_cast<std::size_t>(local_ny_) * nx_);
     for (int ly = 1; ly <= local_ny_; ++ly)
@@ -457,8 +494,8 @@ std::vector<double> LBMSolver::make_local_scalar_nu_eff() const {
     return out;
 }
 
-// vorticity는 시각화에서 wake와 separation을 보기 위한 diagnostic field이다.
-// 중앙차분을 쓰고, solid cell은 0으로 둔다.
+// Vorticity is a diagnostic field for wake and separation visualization.
+// Use central differencing; set solid cells to 0.
 std::vector<double> LBMSolver::make_local_scalar_vorticity() const {
     std::vector<double> out(static_cast<std::size_t>(local_ny_) * nx_);
     const double vel_scale = dx_ / dt_;
@@ -478,8 +515,8 @@ std::vector<double> LBMSolver::make_local_scalar_vorticity() const {
     return out;
 }
 
-// local field를 rank 0 전역 field로 모은다. VTK write 시점에만 호출되어
-// 매 timestep gather 비용이 발생하지 않도록 했다.
+// Gather local field to rank-0 global field; called only during VTK write.
+// so we do not pay gather cost every timestep.
 std::vector<double> LBMSolver::gather_scalar(const std::vector<double>& local) const {
     const auto counts = counts_for_y(ny_, nx_, size_);
     const auto displs = displs_from_counts(counts);
@@ -491,7 +528,7 @@ std::vector<double> LBMSolver::gather_scalar(const std::vector<double>& local) c
     return global;
 }
 
-// ParaView용 VTK 파일 출력. 출력 직전에 macro/LES field를 최신화한 뒤 gather한다.
+// Output VTK for ParaView. Update macro/LES fields and gather just before writing.
 void LBMSolver::write_vtk(int step) {
     compute_macros();
     compute_les_tau();
@@ -508,8 +545,8 @@ void LBMSolver::write_vtk(int step) {
     }
 }
 
-// 각 rank가 계산한 momentum-exchange force를 rank 0에서 합산해 CSV에 저장한다.
-// Cd/Cl은 2D 단위폭 해석 기준으로 reference height를 사용한다.
+// Sum momentum-exchange force from each rank on rank 0 and write CSV.
+// Cd/Cl use reference height under 2D unit-depth interpretation.
 void LBMSolver::write_drag(int step, double local_fx, double local_fy) {
     double global_f[2] = {0.0, 0.0};
     double local_f[2] = {local_fx, local_fy};
@@ -529,7 +566,7 @@ void LBMSolver::write_drag(int step, double local_fx, double local_fy) {
     }
 }
 
-// 긴 run 중 진행 상황과 force coefficient를 확인하기 위한 console log.
+// Console log for progress and force coefficients during long runs.
 void LBMSolver::log_step(int step, double global_fx, double global_fy) const {
     const double h_lu = std::max(ref_height_ / dx_, 1.0);
     const double q_lu = 0.5 * u_lu_ * u_lu_ * h_lu;
@@ -540,7 +577,7 @@ void LBMSolver::log_step(int step, double global_fx, double global_fy) const {
               << " drag_lu=" << global_fx << " lift_lu=" << global_fy << '\n' << std::flush;
 }
 
-// NaN/Inf가 생기면 즉시 모든 rank가 감지하고 예외를 던져 잘못된 결과 저장을 막는다.
+// If NaN/Inf appears, all ranks detect it and throw to avoid writing invalid data.
 void LBMSolver::ensure_finite(int step) const {
     int local_bad = 0;
 #pragma omp parallel for schedule(static) reduction(max:local_bad)
@@ -566,9 +603,10 @@ void LBMSolver::ensure_finite(int step) const {
     }
 }
 
-// 전체 time integration loop. dt는 constructor에서 정한 고정값만 사용한다.
-// 출력/drag/finite check는 interval 기반으로 수행한다.
+// Full time integration loop uses the fixed dt set in constructor.
+// Output, drag, and finite checks are interval-based.
 void LBMSolver::run() {
+    // Collect and print all actionable numerical warnings before stepping.
     std::vector<std::string> runtime_warnings;
     if (tau0_ < 0.505) {
         runtime_warnings.push_back("tau0 < 0.505; this is a high-Re/coarse-grid regime for LBM. Use finer mesh or lower Reynolds for stable validation runs.");
@@ -581,19 +619,25 @@ void LBMSolver::run() {
     }
     print_summary(runtime_warnings);
 
+    // Always write t=0 state for baseline comparisons.
     write_vtk(0);
     double last_fx = 0.0;
     double last_fy = 0.0;
     write_drag(0, 0.0, 0.0);
 
     for (int step = 1; step <= opt_.steps; ++step) {
+        // 1) Recompute macros and LES tau from current populations for physically consistent forcing.
         compute_macros();
         compute_les_tau();
+        // 2) Single explicit BGK collision.
         collide();
+        // 3) Stream populations and apply bounce-back at solid walls (including force contribution).
         const auto force = stream_and_bounce();
+        // 4) Apply inflow / outflow / top-bottom boundary constraints.
         apply_boundaries();
         last_fx = force[0];
         last_fy = force[1];
+        // 5) Check numerical health at drag interval to avoid writing invalid late-time data.
         if (step % opt_.drag_interval == 0 || step == opt_.steps) ensure_finite(step);
         if (step % opt_.drag_interval == 0 || step == opt_.steps) write_drag(step, last_fx, last_fy);
         if (step % opt_.output_interval == 0 || step == opt_.steps) write_vtk(step);

@@ -11,14 +11,18 @@
 #include <sstream>
 #include <stdexcept>
 
-// 이 파일은 사용자가 바꿀 수 있는 모든 옵션을 하나의 Options 구조체로
-// 모으는 역할을 한다.  입력 우선순위는 기본값 -> config 파일 -> --set override이다.
-// 잘못된 물리/수치 파라미터는 solver가 시작되기 전에 여기서 최대한 잡아낸다.
+// Central configuration pipeline:
+// - start from hard-coded defaults (deterministic baseline),
+// - apply INI file entries in section.key form,
+// - then apply CLI "--set" overrides in call order,
+// - finally adjust derived settings (auto mesh) and run validity checks.
+// This guarantees that bad settings are rejected before heavy domain decomposition or MPI startup.
 
 namespace {
 
-// 문자열을 숫자로 바꾸는 작은 helper들. 실패 시 key 이름을 포함한 에러를 던져
-// 어떤 config 항목이 잘못됐는지 바로 확인할 수 있게 한다.
+// Parse "double" values from INI/CLI text and validate full token consumption.
+// We intentionally reject partial parses so accidental suffixes like "10m" are caught
+// instead of silently accepted as 10 and producing confusing physical units.
 double to_double(const std::string& v, const std::string& key) {
     char* end = nullptr;
     const double x = std::strtod(v.c_str(), &end);
@@ -46,14 +50,18 @@ std::uint64_t to_u64(const std::string& v, const std::string& key) {
     return static_cast<std::uint64_t>(x);
 }
 
+// Normalize section/key/value string tokens to lower case for case-insensitive matching.
+// Geometry names and solver names are treated as case-insensitive by design.
 std::string lower_copy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
     return s;
 }
 
-// LES 해상도 기준으로 mesh를 자동 생성하는 옵션이다.
-// eta ≈ L Re^(-3/4)를 사용하고, 실제 목표 격자 간격은 les_delta_to_eta * eta로 둔다.
-// 최종 제출 예제에서는 수동으로 1081x271을 지정했지만, 해상도 산정 로직을 보존한다.
+// Optionally regenerate mesh from the LES target Kolmogorov scale.
+// LES guideline uses η ≈ L * Re^(-3/4) (here L is car_length), and sets
+// cell size h ≈ les_delta_to_eta * η.  This creates a physically motivated mesh.
+// The current final cases keep auto_mesh_from_kolmogorov=false, but this path remains
+// available for quick resolution scaling studies and reproducibility checks.
 void set_auto_mesh(Options& opt, std::vector<std::string>& warnings) {
     if (!opt.auto_mesh_from_kolmogorov) {
         return;
@@ -79,8 +87,9 @@ void set_auto_mesh(Options& opt, std::vector<std::string>& warnings) {
     opt.ny = ny;
 }
 
-// solver가 시작되기 전 최소한의 물리/수치 sanity check를 수행한다.
-// 특히 LBM은 정방형 격자와 낮은 lattice Mach number가 중요하므로 warning을 남긴다.
+// Core safety checks that reject invalid configuration and issue warnings for known risks.
+// The checks focus on solver contract (method options), runtime constraints
+// (positive step counts), and LBM/FVM stability assumptions.
 void sanity_check(Options& opt, std::vector<std::string>& warnings) {
     if (opt.solver_method != "fvm" && opt.solver_method != "lbm") {
         throw std::runtime_error("solver.method must be either fvm or lbm");
@@ -130,9 +139,10 @@ void sanity_check(Options& opt, std::vector<std::string>& warnings) {
     }
 }
 
-} // 익명 namespace
+} // anonymous namespace
 
-// INI parser와 CLI parser가 공통으로 사용하는 공백 제거 함수.
+// Trim helper used by both INI file and CLI parsing.
+// Trims both leading and trailing ASCII whitespace, including tabs and spaces.
 std::string trim_copy(const std::string& s) {
     std::size_t b = 0;
     while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
@@ -141,7 +151,8 @@ std::string trim_copy(const std::string& s) {
     return s.substr(b, e - b);
 }
 
-// true/false 외에도 yes/no/on/off 같은 사람이 쓰기 쉬운 표현을 허용한다.
+// Parse booleans with a compact user-friendly set of aliases.
+// This reduces typing friction for config tweaks while still validating invalid tokens.
 bool parse_bool(const std::string& value) {
     const std::string v = lower_copy(trim_copy(value));
     if (v == "1" || v == "true" || v == "yes" || v == "on") return true;
@@ -149,9 +160,12 @@ bool parse_bool(const std::string& value) {
     throw std::runtime_error("Invalid boolean value: " + value);
 }
 
+// Return a copy of compile-time default configuration.
+// Keeping this as a function makes adding new default fields safer than global state.
 Options ConfigParser::defaults() { return Options{}; }
 
-// --help 출력. MPI 병렬 실행에서도 rank 0만 사용자에게 표시한다.
+// Print help text to a chosen output stream.
+// In MPI execution only rank 0 should call this to avoid interleaved output.
 void ConfigParser::print_help(std::ostream& os, const char* exe) {
     os << "Usage: " << exe << " [--config path] [--set section.key=value] [--write-default-config path]\n"
        << "       " << exe << " --list-geometry\n\n"
@@ -159,7 +173,8 @@ void ConfigParser::print_help(std::ostream& os, const char* exe) {
        << "Example: mpirun -n 4 ./f1_cfd --config examples/f1_demo.ini --set time.steps=5000\n";
 }
 
-// 사용자가 시작점을 만들 수 있도록 기본 INI template을 출력한다.
+// Write a default INI template to a path chosen by the caller.
+// This acts as an official documented baseline for reproducible reruns.
 void ConfigParser::write_default_config(const std::string& path) {
     std::ofstream out(path);
     if (!out) throw std::runtime_error("Cannot write default config to " + path);
@@ -223,8 +238,11 @@ prefix = f1
 )CFG";
 }
 
-// 단순 INI reader. [section] 아래의 key=value를 section.key 형태로 flatten한다.
-// '#' 이후는 주석으로 처리해서 예제 config에 설명을 많이 달 수 있다.
+// Parse a simple INI syntax:
+// - lines "key = value" become entries,
+// - [section] changes the implicit prefix,
+// - comments after '#' are stripped.
+// Flat map keys are stored as "section.key" to keep downstream parser logic simple.
 void ConfigParser::read_file(const std::string& path, std::unordered_map<std::string, std::string>& kv) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("Cannot open config file: " + path);
@@ -254,8 +272,9 @@ void ConfigParser::read_file(const std::string& path, std::unordered_map<std::st
     }
 }
 
-// 하나의 key=value를 Options 필드에 반영한다. 알 수 없는 key는 error 대신 warning으로
-// 남겨서 config 확장/실험 중에도 실행을 완전히 막지 않게 했다.
+// Apply one parsed key-value pair into Options.
+// Unknown keys are intentionally downgraded into runtime warnings so experiments can
+// keep legacy config files that contain extra/obsolete entries without hard failure.
 void ConfigParser::apply_one(Options& opt, const std::string& key_raw, const std::string& value,
                              std::vector<std::string>& warnings) {
     const std::string key = lower_copy(trim_copy(key_raw));
@@ -301,17 +320,20 @@ void ConfigParser::apply_one(Options& opt, const std::string& key_raw, const std
     else warnings.push_back("Ignoring unknown config key: " + key);
 }
 
-// unordered_map의 모든 항목을 Options에 반영한다.
+// Copy every config entry from an unordered map into Options.
+// Iteration order is map-iteration order here; deterministic order is intentionally
+// not required because all values are independent assignments.
 void ConfigParser::apply_kv(Options& opt, const std::unordered_map<std::string, std::string>& kv,
                             std::vector<std::string>& warnings) {
     for (const auto& [key, value] : kv) apply_one(opt, key, value, warnings);
 }
 
-// 전체 config load 절차:
-// 1) 기본값 생성
-// 2) --config 파일 읽기
-// 3) --set override 저장
-// 4) 순서대로 적용한 뒤 auto mesh/sanity check 수행
+// Full configuration loading pipeline:
+// 1) Start from defaults to guarantee every option has a valid baseline.
+// 2) Load INI entries when --config is given.
+// 3) Collect --set overrides in CLI order and apply after file load.
+// 4) Execute derivations/checks (mesh estimation, sanity checks) before returning.
+//   A fully prepared ConfigResult is returned only if no fatal issues were found.
 ConfigResult ConfigParser::load(int argc, char** argv, int mpi_rank) {
     Options opt = defaults();
     std::vector<std::string> warnings;
@@ -320,22 +342,29 @@ ConfigResult ConfigParser::load(int argc, char** argv, int mpi_rank) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        // Print usage and exit early; no solver run should start after --help.
         if (arg == "--help" || arg == "-h") {
             if (mpi_rank == 0) print_help(std::cout, argv[0]);
             std::exit(0);
+        // Load one optional config file; repeated use can merge later files if needed.
         } else if (arg == "--config" || arg == "-c") {
             if (++i >= argc) throw std::runtime_error("--config requires a path");
             read_file(argv[i], file_kv);
+        // Runtime override syntax: --set key=value.
+        // These always win over file values, and can be used to quickly sweep parameters.
         } else if (arg == "--set") {
             if (++i >= argc) throw std::runtime_error("--set requires key=value");
             const std::string kv = argv[i];
             const auto eq = kv.find('=');
             if (eq == std::string::npos) throw std::runtime_error("--set requires key=value");
             overrides.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+        // Dump a reference configuration template and terminate.
+        // Useful for CI bootstrap and reproducible test-case capture.
         } else if (arg == "--write-default-config") {
             if (++i >= argc) throw std::runtime_error("--write-default-config requires a path");
             if (mpi_rank == 0) write_default_config(argv[i]);
             std::exit(0);
+        // Print supported built-in geometry presets and primitive-file syntax.
         } else if (arg == "--list-geometry") {
             if (mpi_rank == 0) {
                 std::cout << "Built-in presets:\n"

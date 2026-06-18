@@ -11,22 +11,23 @@
 // ---------------------------------------------------------------------------
 // FVMSolver
 // ---------------------------------------------------------------------------
-// 확장/비교용 finite-volume projection LES solver.
-// 현재 최종 제출 결과는 안정 검증된 LBM 경로에서 생성했지만, FVM 구조를
-// 별도로 유지해 solver.method=fvm으로 실험할 수 있게 했다.
+// Optional finite-volume comparison path.
+// It follows projection-method Navier-Stokes with explicit LES update and
+// retains an interface close to LBMSolver for run-time option parity.
 class FVMSolver {
 public:
     FVMSolver(const Options& opt, const Geometry2D& geom, MPI_Comm comm);
     void run();
 
 private:
-    // 입력 옵션/형상과 MPI 실행 정보.
+    // Immutable configuration and geometry reference.
     const Options opt_;
     const Geometry2D& geom_;
     MPI_Comm comm_ = MPI_COMM_WORLD;
     int rank_ = 0;
     int size_ = 1;
 
+    // Decomposition metadata.
     int nx_ = 0;
     int ny_ = 0;
     int local_ny_ = 0;
@@ -34,7 +35,7 @@ private:
     int lower_rank_ = MPI_PROC_NULL;
     int upper_rank_ = MPI_PROC_NULL;
 
-    // 물리 격자, timestep, 점성, Reynolds/Kolmogorov 추정값.
+    // Grid spacing, fixed physical timestep, and flow scales.
     double dx_ = 0.0;
     double dy_ = 0.0;
     double dt_ = 0.0;
@@ -43,7 +44,12 @@ private:
     double eta_ = 0.0;
     double ref_height_ = 1.0;
 
-    // cell-centered FVM field. predictor/projection 단계 때문에 보조 배열을 분리했다.
+    // Cell-centered primary variables and auxiliaries.
+    // u/v        : velocity components [m/s]
+    // p          : pressure [Pa]
+    // u_pred/u_star, v_pred/v_star : RK2 prediction/correction stages
+    // rhs/nu_eff etc. : right-hand side and viscosity fields
+    // phi_        : pressure correction potential
     std::vector<double> u_;
     std::vector<double> v_;
     std::vector<double> p_;
@@ -61,10 +67,10 @@ private:
     std::vector<double> div_rhs_;
     std::vector<unsigned char> solid_;
 
-    // rank 0의 force history 출력 파일.
+    // Rank-0 drag history output.
     std::ofstream drag_csv_;
 
-    // halo row를 포함한 local 배열 index helper.
+    // Flat indices with halo rows.
     [[nodiscard]] int cell(int ly, int x) const { return ly * nx_ + x; }
     [[nodiscard]] int global_y(int ly) const { return y_start_ + (ly - 1); }
     [[nodiscard]] double phys_x(int x) const { return static_cast<double>(x) * dx_; }
@@ -77,7 +83,7 @@ private:
     void initialize_outputs();
     void print_summary() const;
 
-    // FVM 한 step을 구성하는 주요 연산: boundary, LES 점성, RHS, pressure projection.
+    // One-step FVM pipeline primitives.
     void exchange_scalar_rows(std::vector<double>& a, int tag_base) const;
     void apply_velocity_bc(std::vector<double>& u, std::vector<double>& v);
     void apply_pressure_bc(std::vector<double>& phi);
@@ -87,7 +93,7 @@ private:
     void project_velocity();
     double pressure_poisson();
 
-    // 출력 및 force 계산을 위한 rank 0 gather helper.
+    // Output data preparation helpers (rank-local + global gather).
     std::vector<double> gather_scalar(const std::vector<double>& local) const;
     std::vector<double> local_scalar(const std::vector<double>& a) const;
     std::vector<double> local_solid() const;

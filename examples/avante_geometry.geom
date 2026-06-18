@@ -1,6 +1,6 @@
-# Hyundai Avante(CN7 facelift 계열) 공식 side-view 사진을 보고 단순화한 2D 외곽선.
-# 좌표는 local meter 단위이며, 전체 길이 약 4.71 m / 전고 약 1.42 m 스케일이다.
-# 실제 CAD가 아니라 CFD solid mask용 photo-traced approximation이다.
+# Simplified 2D outline from official Hyundai Avante (CN7 facelift) side-view photographs.
+# Coordinates are local meters, approx length 4.71 m and height 1.42 m.
+# Photo-traced CFD solid-mask approximation, not real CAD.
 name hyundai_avante_photo_traced
 polygon 0.02 0.33 0.18 0.48 0.55 0.62 0.95 0.76 1.28 1.08 1.70 1.29 2.18 1.38 2.78 1.36 3.30 1.20 3.72 0.92 4.20 0.78 4.58 0.62 4.71 0.43 4.60 0.30 4.10 0.27 3.55 0.27 3.22 0.31 1.42 0.31 1.03 0.27 0.48 0.27 0.02 0.33
 circle 1.03 0.35 0.335
